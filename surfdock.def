@@ -1,0 +1,157 @@
+Bootstrap: docker
+From: nvidia/cuda:12.1.1-devel-ubuntu22.04
+
+%labels
+    Maintainer SurfDock Team
+    Version 1.0
+    Description Apptainer image for SurfDock virtual screening
+
+%environment
+    export LC_ALL=C
+    export PATH=/opt/micromamba/bin:$PATH
+    # Activate the environment
+    export MAMBA_ROOT_PREFIX=/opt/micromamba
+    eval "$(/opt/micromamba/bin/micromamba shell hook --shell bash)"
+    micromamba activate SurfDock
+    
+    # SurfDock specific
+    export SURFDOCK_ROOT=/opt/SurfDock
+    export PYTHONPATH=$SURFDOCK_ROOT:$PYTHONPATH
+    export MSMS_BIN=$SURFDOCK_ROOT/comp_surface/tools/APBS-3.4.1.Linux/bin/msms
+    export PDB2PQR_BIN=$SURFDOCK_ROOT/comp_surface/tools/pdb2pqr-linux-bin64-2.1.1/pdb2pqr
+    export APBS_BIN=$SURFDOCK_ROOT/comp_surface/tools/APBS-3.4.1.Linux/bin/apbs
+    export MULTIVALUE_BIN=$SURFDOCK_ROOT/comp_surface/tools/APBS-3.4.1.Linux/share/apbs/tools/bin/multivalue
+    export BABEL_LIBDIR=/opt/micromamba/envs/SurfDock/lib/openbabel/3.1.0
+
+    # ESM and Torch weights
+    export TORCH_HOME=/opt/torch_cache
+    export ESM_MODEL_CACHE=/opt/torch_cache/hub/checkpoints
+
+%files
+    . /opt/SurfDock
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y --no-install-recommends \
+        wget \
+        git \
+        bzip2 \
+        ca-certificates \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        build-essential \
+        && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+    # Install Micromamba
+    mkdir -p /opt/micromamba
+    wget -qO- https://micromamba.snakepit.net/api/micromamba/linux-64/latest | tar -xj -C /opt/micromamba --strip-components=1 bin/micromamba
+    export PATH=/opt/micromamba/bin:$PATH
+    export MAMBA_ROOT_PREFIX=/opt/micromamba
+    eval "$(micromamba shell hook --shell bash)"
+
+    # Create Environment
+    micromamba create -y -n SurfDock python=3.10 -c conda-forge
+    micromamba activate SurfDock
+
+    # Install main dependencies (following README.md recommendations)
+    micromamba install -y -c pytorch -c nvidia -c pyg -c conda-forge -c defaults \
+        pytorch==2.2.2 \
+        pytorch-cuda=12.1 \
+        numpy==1.24.4 \
+        scipy==1.8.1 \
+        pandas==2.1.2 \
+        openff-toolkit==0.15.2 \
+        openmm==8.1.1 \
+        openmmforcefields==0.12.0 \
+        pdbfixer==1.9 \
+        babel==2.13.1 \
+        biopandas==0.4.1 \
+        openbabel==3.1.1 \
+        plyfile==1.0.1 \
+        prody==2.4.0 \
+        torch-ema==0.3 \
+        torchmetrics==1.2.1 \
+        loguru \
+        pyg
+
+    # Install PyG extras
+    pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
+
+    # Install pip packages
+    pip install -U --no-cache-dir \
+        spyrmsd \
+        scikit-learn==1.3.2 \
+        accelerate==0.15.0 \
+        biopython==1.79 \
+        e3nn==0.5.1 \
+        huggingface-hub==0.17.3 \
+        mdanalysis==2.4.0 \
+        posebusters==0.2.7 \
+        rdkit==2023.3.1 \
+        tokenizers==0.13.3 \
+        transformers==4.29.2 \
+        wandb==0.16.1 \
+        dimorphite_dl \
+        prefetch_generator
+
+    # PyMesh2 (Specific wheel for Python 3.10)
+    pip install https://github.com/nuvolos-cloud/PyMesh/releases/download/v0.3.1/pymesh2-0.3.1-cp310-cp310-linux_x86_64.whl
+
+    # ESM (As mentioned in README)
+    cd /opt
+    git clone https://github.com/facebookresearch/esm
+    cd esm
+    pip install -e .
+
+    # Pre-download ESM weights for portability
+    export TORCH_HOME=/opt/torch_cache
+    mkdir -p $TORCH_HOME
+    micromamba run -n SurfDock python -c "import esm; esm.pretrained.esm2_t33_650M_UR50D()"
+    chmod -R a+rX /opt/torch_cache
+
+    # Additional conda packages for screening
+    micromamba install -y -c mx reduce
+    micromamba install -y -c conda-forge openbabel
+
+    # Finalize SurfDock
+    cd /opt/SurfDock
+    
+    # Extract APBS/PDB2PQR
+    cd comp_surface/tools
+    tar -zxvf APBS_PDB2PQR.tar.gz
+    # rm APBS_PDB2PQR.tar.gz # Keep it or remove it? Usually remove to save space.
+    
+    # Fix PyMesh libstdc++ issue (Tip 1 in README)
+    PYMESH_DIR=$(micromamba run -n SurfDock python -c "import pymesh; import os; print(os.path.dirname(pymesh.__file__))")
+    if [ -f "$PYMESH_DIR/lib/libstdc++.so.6" ]; then
+        mv "$PYMESH_DIR/lib/libstdc++.so.6" "$PYMESH_DIR/lib/libstdc++.so.6.bak"
+    fi
+
+    # Update global_vars.py to use absolute paths in /opt/SurfDock
+    sed -i 's|~/SurfDock|/opt/SurfDock|g' /opt/SurfDock/comp_surface/prepare_target/default_config/global_vars.py
+
+%runscript
+    # Default to help message or bash
+    if [ $# -eq 0 ]; then
+        echo "SurfDock Apptainer Container"
+        echo "----------------------------"
+        echo "Environment: CUDA 12.1, SurfDock dependencies, and ESM weights pre-loaded."
+        echo ""
+        echo "Usage: apptainer exec --nv surfdock.sif <command>"
+        echo ""
+        echo "1. Custom Screening (PDB + SMI + Pocket Coordinates):"
+        echo "   apptainer exec --nv surfdock.sif bash /opt/SurfDock/bash_scripts/test_scripts/screen_custom.sh \\"
+        echo "       --protein protein.pdb \\"
+        echo "       --ligands ligands.smi \\"
+        echo "       --pocket_center \"x,y,z\" \\"
+        echo "       --radius 8.0 \\"
+        echo "       --out_dir ./results"
+        echo ""
+        echo "2. Standard Screening Pipeline:"
+        echo "   apptainer exec --nv surfdock.sif bash /opt/SurfDock/bash_scripts/test_scripts/screen_pipeline_container.sh"
+    else
+        exec "$@"
+    fi
