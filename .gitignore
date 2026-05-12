@@ -185,3 +185,5 @@ bash_scripts/*/*/*.out
 
 
 .aider*
+apptainer
+build_cache/

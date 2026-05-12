@@ -8,11 +8,8 @@ From: nvidia/cuda:12.1.1-devel-ubuntu22.04
 
 %environment
     export LC_ALL=C
-    export PATH=/opt/micromamba/bin:$PATH
-    # Activate the environment
-    export MAMBA_ROOT_PREFIX=/opt/micromamba
-    eval "$(/opt/micromamba/bin/micromamba shell hook --shell bash)"
-    micromamba activate SurfDock
+    export PATH=/opt/micromamba/envs/SurfDock/bin:/opt/micromamba/bin:$PATH
+    export CONDA_PREFIX=/opt/micromamba/envs/SurfDock
     
     # SurfDock specific
     export SURFDOCK_ROOT=/opt/SurfDock
@@ -29,8 +26,11 @@ From: nvidia/cuda:12.1.1-devel-ubuntu22.04
 
 %files
     . /opt/SurfDock
+    build_cache/torch /opt/torch_cache
+    build_cache/pymesh2-0.3.1-cp310-cp310-linux_x86_64.whl /opt/pymesh2-0.3.1-cp310-cp310-linux_x86_64.whl
 
 %post
+    set -e
     export DEBIAN_FRONTEND=noninteractive
     apt-get update && apt-get install -y --no-install-recommends \
         wget \
@@ -47,17 +47,15 @@ From: nvidia/cuda:12.1.1-devel-ubuntu22.04
 
     # Install Micromamba
     mkdir -p /opt/micromamba
-    wget -qO- https://micromamba.snakepit.net/api/micromamba/linux-64/latest | tar -xj -C /opt/micromamba --strip-components=1 bin/micromamba
+    wget -qO- https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C /opt/micromamba bin/micromamba
     export PATH=/opt/micromamba/bin:$PATH
     export MAMBA_ROOT_PREFIX=/opt/micromamba
-    eval "$(micromamba shell hook --shell bash)"
 
     # Create Environment
     micromamba create -y -n SurfDock python=3.10 -c conda-forge
-    micromamba activate SurfDock
 
     # Install main dependencies (following README.md recommendations)
-    micromamba install -y -c pytorch -c nvidia -c pyg -c conda-forge -c defaults \
+    micromamba install -y -n SurfDock -c pytorch -c nvidia -c pyg -c conda-forge -c defaults \
         pytorch==2.2.2 \
         pytorch-cuda=12.1 \
         numpy==1.24.4 \
@@ -78,10 +76,10 @@ From: nvidia/cuda:12.1.1-devel-ubuntu22.04
         pyg
 
     # Install PyG extras
-    pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
+    micromamba run -n SurfDock pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
 
     # Install pip packages
-    pip install -U --no-cache-dir \
+    micromamba run -n SurfDock pip install -U --no-cache-dir \
         spyrmsd \
         scikit-learn==1.3.2 \
         accelerate==0.15.0 \
@@ -97,41 +95,62 @@ From: nvidia/cuda:12.1.1-devel-ubuntu22.04
         dimorphite_dl \
         prefetch_generator
 
-    # PyMesh2 (Specific wheel for Python 3.10)
-    pip install https://github.com/nuvolos-cloud/PyMesh/releases/download/v0.3.1/pymesh2-0.3.1-cp310-cp310-linux_x86_64.whl
+    # Install PyMesh from local wheel
+    micromamba run -n SurfDock pip install /opt/pymesh2-0.3.1-cp310-cp310-linux_x86_64.whl
+    rm /opt/pymesh2-0.3.1-cp310-cp310-linux_x86_64.whl
 
     # ESM (As mentioned in README)
     cd /opt
     git clone https://github.com/facebookresearch/esm
     cd esm
-    pip install -e .
+    micromamba run -n SurfDock pip install -e .
 
     # Pre-download ESM weights for portability
-    export TORCH_HOME=/opt/torch_cache
-    mkdir -p $TORCH_HOME
-    micromamba run -n SurfDock python -c "import esm; esm.pretrained.esm2_t33_650M_UR50D()"
+    # ESM and Torch weights are already in /opt/torch_cache via %files
+    # We just need to ensure permissions are correct
     chmod -R a+rX /opt/torch_cache
 
     # Additional conda packages for screening
-    micromamba install -y -c mx reduce
-    micromamba install -y -c conda-forge openbabel
+    # 'reduce' is already provided by ambertools, so we only need openbabel
+    echo "Installing additional tools..."
+    micromamba install -y -n SurfDock -c conda-forge openbabel
 
     # Finalize SurfDock
     cd /opt/SurfDock
     
     # Extract APBS/PDB2PQR
+    echo "Extracting bioinformatics tools..."
+    df -h /
     cd comp_surface/tools
-    tar -zxvf APBS_PDB2PQR.tar.gz
-    # rm APBS_PDB2PQR.tar.gz # Keep it or remove it? Usually remove to save space.
+    if [ ! -f "APBS_PDB2PQR.tar.gz" ]; then
+        echo "ERROR: APBS_PDB2PQR.tar.gz not found in /opt/SurfDock/comp_surface/tools"
+        ls -R /opt/SurfDock/comp_surface/tools
+        exit 1
+    fi
+    tar -zxf APBS_PDB2PQR.tar.gz --strip-components=1
+    rm APBS_PDB2PQR.tar.gz
+    echo "Extraction complete."
+    df -h /
     
     # Fix PyMesh libstdc++ issue (Tip 1 in README)
-    PYMESH_DIR=$(micromamba run -n SurfDock python -c "import pymesh; import os; print(os.path.dirname(pymesh.__file__))")
-    if [ -f "$PYMESH_DIR/lib/libstdc++.so.6" ]; then
+    echo "Patching PyMesh..."
+    PYMESH_DIR=$(micromamba run -n SurfDock python -c "import pymesh; import os; print(os.path.dirname(pymesh.__file__))" 2>/dev/null || echo "")
+    if [ -n "$PYMESH_DIR" ] && [ -f "$PYMESH_DIR/lib/libstdc++.so.6" ]; then
         mv "$PYMESH_DIR/lib/libstdc++.so.6" "$PYMESH_DIR/lib/libstdc++.so.6.bak"
+        echo "PyMesh patched successfully."
+    else
+        echo "PyMesh patch skipped (already patched or not found)."
     fi
 
     # Update global_vars.py to use absolute paths in /opt/SurfDock
-    sed -i 's|~/SurfDock|/opt/SurfDock|g' /opt/SurfDock/comp_surface/prepare_target/default_config/global_vars.py
+    echo "Updating configuration paths..."
+    GLOBAL_VARS="/opt/SurfDock/comp_surface/prepare_target/default_config/global_vars.py"
+    if [ -f "$GLOBAL_VARS" ]; then
+        sed -i 's|~/SurfDock|/opt/SurfDock|g' "$GLOBAL_VARS"
+        echo "Configuration updated."
+    else
+        echo "WARNING: global_vars.py not found at $GLOBAL_VARS"
+    fi
 
 %runscript
     # Default to help message or bash
